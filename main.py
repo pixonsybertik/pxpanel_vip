@@ -460,13 +460,43 @@ async def api_logout(request: Request):
 
 @app.get("/")
 async def root(request: Request):
-    if needs_setup():
-        return RedirectResponse("/setup")
-    token = request.cookies.get(SESSION_COOKIE)
-    if session_ok(token):
-        return RedirectResponse("/dashboard")
-    # no public landing — redirect to secure path
-    return RedirectResponse("/pxpanelworking")
+    """Always serve decoy reCAPTCHA landing — curl, browser, bots, anything."""
+    return HTMLResponse(
+        DECOY_HTML,
+        status_code=200,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "X-Robots-Tag": "noindex, nofollow, noarchive, nosnippet",
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "SAMEORIGIN",
+            "Content-Language": "en",
+            "Server": "cloudflare",  # soft fingerprint noise
+        },
+    )
+
+
+@app.get("/robots.txt")
+async def robots():
+    return Response(
+        "User-agent: *\nDisallow: /\n",
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+# Common probe paths → same decoy (no panel leak)
+@app.get("/index.html")
+@app.get("/home")
+@app.get("/login")
+@app.get("/admin")
+@app.get("/panel")
+@app.get("/wp-admin")
+@app.get("/wp-login.php")
+async def decoy_aliases(request: Request):
+    return await root(request)
 
 # ── Dashboard ───────────────────────────────────────────────
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -629,26 +659,214 @@ async def api_protocols(_=Depends(require_auth)):
     }
 
 # ── Subscription ────────────────────────────────────────────
-@app.get("/sub/{uuid}")
-async def sub_single(uuid: str, request: Request):
-    async with LINKS_LOCK:
-        link = LINKS.get(uuid)
-    if not is_allowed(link):
-        raise HTTPException(404)
-    host = get_host(request)
+
+def _sub_lines(uuid: str, link: dict, host: str) -> list[str]:
     n = max(1, min(40, int(link.get("config_count") or 1)))
     lines = []
     for i in range(n):
         name = link.get("label") or "PX"
         if n > 1:
-            name = f"{name}-{i+1}"
-        lines.append(generate_vless_link(
-            uuid, host, name, link.get("protocol") or DEFAULT_PROTOCOL,
-            link.get("fingerprint") or DEFAULT_FINGERPRINT,
-            link.get("alpn") or "http/1.1",
-            int(link.get("port") or 443),
-        ))
-    body = base64.b64encode("\n".join(lines).encode()).decode()
+            name = f"{name}-{i + 1}"
+        lines.append(
+            generate_vless_link(
+                uuid,
+                host,
+                name,
+                link.get("protocol") or DEFAULT_PROTOCOL,
+                link.get("fingerprint") or DEFAULT_FINGERPRINT,
+                link.get("alpn") or "http/1.1",
+                int(link.get("port") or 443),
+            )
+        )
+    return lines
+
+
+def _wants_html(request: Request) -> bool:
+    """Browser page vs raw subscription for clients."""
+    if request.query_params.get("raw") in ("1", "true", "yes"):
+        return False
+    if request.query_params.get("format") == "base64":
+        return False
+    accept = (request.headers.get("accept") or "").lower()
+    ua = (request.headers.get("user-agent") or "").lower()
+    if "text/html" in accept:
+        return True
+    if any(x in ua for x in ("mozilla", "chrome", "safari", "edg/", "firefox", "mobile")):
+        # still prefer raw if known proxy clients
+        if any(x in ua for x in ("v2ray", "clash", "sing-box", "shadowrocket", "quantumult", "surge", "hiddify", "streisand", "nekobox", "passwall")):
+            return False
+        return True
+    return False
+
+
+def _fmt_expire(link: dict) -> str:
+    exp = link.get("expires_at")
+    if not exp:
+        return "بدون انقضا"
+    try:
+        dt = datetime.fromisoformat(str(exp).replace("Z", ""))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(exp)[:16]
+
+
+def render_sub_page(uuid: str, link: dict, host: str, lines: list[str], b64: str) -> str:
+    label = link.get("label") or "PX"
+    proto = link.get("protocol") or DEFAULT_PROTOCOL
+    used = int(link.get("used_bytes") or 0)
+    lim = int(link.get("limit_bytes") or 0)
+    used_h = fmt_bytes(used)
+    lim_h = fmt_bytes(lim) if lim > 0 else "∞"
+    pct = min(100, int(used * 100 / lim)) if lim > 0 else 0
+    status = "فعال" if is_allowed(link) else "غیرفعال"
+    status_cls = "ok" if is_allowed(link) else "bad"
+    ip_l = int(link.get("ip_limit") or 0) or "∞"
+    conn_l = int(link.get("connection_limit") or 0) or "∞"
+    speed = int(link.get("speed_limit_bytes") or 0)
+    speed_h = f"{(speed * 8 / 1_000_000):.1f} Mbps" if speed > 0 else "∞"
+    expire_h = _fmt_expire(link)
+    sub_url = f"https://{host}/sub/{uuid}"
+    raw_url = f"https://{host}/sub/{uuid}?raw=1"
+    configs_html = ""
+    for i, ln in enumerate(lines):
+        configs_html += f"""
+        <div class="cfg">
+          <div class="cfg-top">
+            <span class="tag">#{i + 1}</span>
+            <button type="button" class="btn" onclick="copyText(this.getAttribute('data-c'))" data-c="{ln.replace('&', '&amp;').replace('"', '&quot;')}">کپی</button>
+          </div>
+          <code class="link">{ln}</code>
+        </div>"""
+    # escape for HTML in label etc
+    def e(s):
+        return (
+            str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    label_e = e(label)
+    return f"""<!DOCTYPE html>
+<html lang="fa">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PX · {label_e}</title>
+<style>
+:root{{
+  --bg:#121214;--bg2:#1a1a1d;--bg3:#222226;--line:#2e2e33;
+  --t1:#ececec;--t2:#a0a0a8;--t3:#6b6b74;
+  --acc:#5b7cfa;--ok:#3d9a6a;--bad:#c45c5c;
+  --r:12px;--font:'Segoe UI',Tahoma,system-ui,sans-serif;
+}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg);color:var(--t1);font-family:var(--font);font-size:13px;direction:rtl;min-height:100vh;padding:28px 16px 48px}}
+.wrap{{max-width:640px;margin:0 auto}}
+.brand{{font-size:12px;color:var(--t3);letter-spacing:.08em;margin-bottom:8px}}
+h1{{font-size:20px;font-weight:700;margin-bottom:6px}}
+.sub{{color:var(--t3);font-size:12px;margin-bottom:18px}}
+.card{{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}}
+.row{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
+@media(max-width:560px){{.row{{grid-template-columns:1fr}}}}
+.stat .l{{font-size:11px;color:var(--t3);margin-bottom:4px}}
+.stat .v{{font-size:15px;font-weight:600}}
+.badge{{display:inline-block;padding:3px 8px;border-radius:6px;font-size:11px;background:var(--bg3)}}
+.badge.ok{{color:var(--ok);background:rgba(61,154,106,.12)}}
+.badge.bad{{color:var(--bad);background:rgba(196,92,92,.12)}}
+.bar{{height:8px;background:var(--line);border-radius:99px;overflow:hidden;margin-top:10px}}
+.bar>i{{display:block;height:100%;background:var(--acc);width:{pct}%}}
+.btn{{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--bg3);color:var(--t1);cursor:pointer;font-size:12px;font-family:inherit}}
+.btn:hover{{border-color:var(--t3)}}
+.btn-p{{background:var(--acc);border-color:var(--acc);color:#fff}}
+.actions{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
+.cfg{{border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:8px;background:var(--bg3)}}
+.cfg-top{{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}}
+.tag{{font-size:11px;color:var(--t3)}}
+code.link{{display:block;font-size:11px;word-break:break-all;color:var(--t2);line-height:1.55;font-family:ui-monospace,monospace}}
+code.b64{{display:block;font-size:10px;word-break:break-all;color:var(--t3);max-height:120px;overflow:auto;line-height:1.5;font-family:ui-monospace,monospace;background:var(--bg);padding:10px;border-radius:8px;border:1px solid var(--line)}}
+.foot{{margin-top:18px;text-align:center;color:var(--t3);font-size:11px}}
+.toast{{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--line);padding:10px 16px;border-radius:8px;opacity:0;transition:.2s;z-index:9}}
+.toast.show{{opacity:1}}
+h2{{font-size:13px;font-weight:600;margin-bottom:10px;color:var(--t2)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">PX SUBSCRIPTION</div>
+  <h1>{label_e}</h1>
+  <p class="sub">شناسه · <code style="color:var(--t2)">{e(uuid)}</code></p>
+
+  <div class="card">
+    <div class="row">
+      <div class="stat"><div class="l">وضعیت</div><div class="v"><span class="badge {status_cls}">{status}</span></div></div>
+      <div class="stat"><div class="l">پروتکل</div><div class="v">{e(proto)}</div></div>
+      <div class="stat"><div class="l">مصرف</div><div class="v">{used_h} / {lim_h}</div></div>
+      <div class="stat"><div class="l">انقضا</div><div class="v">{e(expire_h)}</div></div>
+      <div class="stat"><div class="l">محدودیت IP</div><div class="v">{ip_l}</div></div>
+      <div class="stat"><div class="l">کاربر همزمان</div><div class="v">{conn_l}</div></div>
+      <div class="stat"><div class="l">سرعت</div><div class="v">{speed_h}</div></div>
+      <div class="stat"><div class="l">تعداد در ساب</div><div class="v">{len(lines)}</div></div>
+    </div>
+    <div class="bar"><i></i></div>
+    <div class="actions">
+      <button class="btn btn-p" onclick="copyText('{e(sub_url)}')">کپی لینک ساب</button>
+      <button class="btn" onclick="copyText('{e(raw_url)}')">کپی خروجی خام</button>
+      <button class="btn" onclick="copyText(document.getElementById('b64').innerText)">کپی Base64</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>کانفیگ‌ها</h2>
+    {configs_html}
+  </div>
+
+  <div class="card">
+    <h2>Base64</h2>
+    <code class="b64" id="b64">{e(b64)}</code>
+    <div class="actions">
+      <button class="btn" onclick="copyText(document.getElementById('b64').innerText)">کپی Base64</button>
+      <a class="btn" href="{e(raw_url)}">دانلود raw</a>
+    </div>
+  </div>
+
+  <div class="foot">PX · همه چیز روی /sub · بدون مسیر اضافه</div>
+</div>
+<div class="toast" id="toast">کپی شد</div>
+<script>
+function copyText(t){{
+  navigator.clipboard.writeText(t).then(()=>{{
+    const el=document.getElementById('toast');
+    el.classList.add('show');
+    setTimeout(()=>el.classList.remove('show'),1600);
+  }}).catch(()=>{{}});
+}}
+</script>
+</body>
+</html>"""
+
+
+@app.get("/sub/{uuid}")
+async def sub_single(uuid: str, request: Request):
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not link:
+        raise HTTPException(404, detail="not found")
+    # allow page view even if near-limit; block only fully missing
+    host = get_host(request)
+    lines = _sub_lines(uuid, link, host)
+    if not lines:
+        raise HTTPException(404, detail="empty")
+    plain = "\n".join(lines)
+    b64 = base64.b64encode(plain.encode()).decode()
+
+    # Stylish browser page — all info on /sub (no /info, no /user_info)
+    if _wants_html(request):
+        html = render_sub_page(uuid, link, host, lines, b64)
+        return HTMLResponse(html)
+
+    # Raw base64 for clients (v2rayNG, Hiddify, ...)
     used = int(link.get("used_bytes") or 0)
     lim = int(link.get("limit_bytes") or 0)
     exp = 0
@@ -658,12 +876,16 @@ async def sub_single(uuid: str, request: Request):
         except Exception:
             exp = 0
     headers = {
-        "subscription-userinfo": f"upload=0; download={used}; total={lim}; expire={exp}",
         "profile-title": base64.b64encode((link.get("label") or "PX").encode()).decode(),
         "profile-update-interval": "12",
         "content-disposition": 'inline; filename="px.txt"',
+        # traffic hint without separate user_info path
+        "x-px-used": str(used),
+        "x-px-total": str(lim),
+        "x-px-expire": str(exp),
     }
-    return Response(content=body, media_type="text/plain; charset=utf-8", headers=headers)
+    return Response(content=b64, media_type="text/plain; charset=utf-8", headers=headers)
+
 
 # ── Optional modules ────────────────────────────────────────
 try:
@@ -773,6 +995,155 @@ async function post(url,body){{
   return j;
 }}
 </script></body></html>"""
+
+
+DECOY_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+<meta name="description" content="Security check">
+<title>Just a moment...</title>
+<style>
+html,body{height:100%;margin:0;padding:0}
+body{
+  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen,Ubuntu,Cantarell,"Helvetica Neue",Arial,sans-serif;
+  background:#f0f2f5;color:#1c1e21;
+  display:flex;align-items:center;justify-content:center;
+  min-height:100vh;padding:20px;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{width:min(400px,100%)}
+.box{
+  background:#ffffff;
+  border:1px solid #dadce0;
+  border-radius:8px;
+  box-shadow:0 1px 2px rgba(60,64,67,.3),0 1px 3px 1px rgba(60,64,67,.15);
+  padding:32px 28px 24px;
+}
+.row-top{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.cf-mark{
+  width:36px;height:36px;border-radius:4px;background:#f48120;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.cf-mark svg{width:22px;height:22px}
+h1{font-size:16px;font-weight:600;margin:0;color:#202124;line-height:1.35}
+.lead{font-size:13px;color:#5f6368;line-height:1.55;margin:0 0 20px}
+.widget{
+  border:1px solid #d3d3d3;border-radius:3px;background:#f9f9f9;
+  padding:12px 12px 12px 14px;display:flex;align-items:center;gap:14px;
+  min-height:78px;user-select:none;
+}
+.check{
+  width:28px;height:28px;border:2px solid #c1c1c1;border-radius:2px;
+  background:#fff;cursor:pointer;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;position:relative;
+}
+.check.spin::before{
+  content:"";width:16px;height:16px;border-radius:50%;
+  border:2px solid #1a73e8;border-top-color:transparent;
+  animation:r .65s linear infinite;
+}
+.check.done{background:#1a73e8;border-color:#1a73e8}
+.check.done svg{display:block}
+.check svg{display:none;width:16px;height:16px}
+@keyframes r{to{transform:rotate(360deg)}}
+.label{font-size:14px;color:#202124;flex:1}
+.rc{
+  text-align:right;line-height:1.2;margin-left:auto;flex-shrink:0;
+}
+.rc b{display:block;font-size:10px;color:#555;letter-spacing:.02em}
+.rc i{display:block;font-size:9px;color:#9aa0a6;font-style:normal;margin-top:2px}
+.meta{margin-top:18px;font-size:11px;color:#9aa0a6;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.meta a{color:#9aa0a6;text-decoration:none;pointer-events:none}
+.msg{margin-top:14px;font-size:12px;color:#5f6368;min-height:18px}
+.msg.err{color:#d93025}
+.footer{
+  margin-top:14px;text-align:center;font-size:11px;color:#9aa0a6;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="box">
+    <div class="row-top">
+      <div class="cf-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="#fff"><path d="M16.5 12.5c0-.3-.1-.5-.3-.7l-3.2-3.2c-.4-.4-1-.4-1.4 0-.4.4-.4 1 0 1.4L13.6 12l-2 2c-.4.4-.4 1 0 1.4.4.4 1 .4 1.4 0l3.2-3.2c.2-.2.3-.4.3-.7z"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 18c-4.4 0-8-3.6-8-8s3.6-8 8-8 8 3.6 8 8-3.6 8-8 8z"/></svg>
+      </div>
+      <h1>Checking if the site connection is secure</h1>
+    </div>
+    <p class="lead">This website uses a security service to protect against malicious bots. Please complete the challenge below to continue.</p>
+    <div class="widget">
+      <div class="check" id="ck" role="checkbox" aria-checked="false" tabindex="0" title="Verify"></div>
+      <div class="label" id="lb">I&apos;m not a robot</div>
+      <div class="rc"><b>reCAPTCHA</b><i>Privacy · Terms</i></div>
+    </div>
+    <div class="msg" id="msg">Enable JavaScript and cookies to continue</div>
+    <div class="meta">
+      <span>Ray ID: <span id="ray">—</span></span>
+      <span><a href="#">Privacy</a> · <a href="#">Terms</a></span>
+    </div>
+  </div>
+  <div class="footer">Performance &amp; security by Cloudflare</div>
+</div>
+<script>
+(function () {
+  function ray() {
+    try {
+      var a = new Uint8Array(8);
+      crypto.getRandomValues(a);
+      return Array.prototype.map.call(a, function (b) {
+        return ("0" + b.toString(16)).slice(-2);
+      }).join("");
+    } catch (e) {
+      return String(Date.now().toString(16)) + Math.random().toString(16).slice(2, 10);
+    }
+  }
+  document.getElementById("ray").textContent = ray();
+  var ck = document.getElementById("ck");
+  var lb = document.getElementById("lb");
+  var msg = document.getElementById("msg");
+  var busy = false;
+  msg.textContent = "Checking your browser before accessing this site.";
+  setTimeout(function () {
+    if (!busy) msg.textContent = "Waiting for verification…";
+  }, 1400);
+  function go() {
+    if (busy) return;
+    busy = true;
+    ck.classList.add("spin");
+    lb.textContent = "Verifying…";
+    msg.className = "msg";
+    msg.textContent = "Verifying you are human. This may take a few seconds.";
+    setTimeout(function () {
+      ck.classList.remove("spin");
+      ck.classList.add("done");
+      ck.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg>';
+      lb.textContent = "I\'m not a robot";
+      msg.className = "msg err";
+      msg.textContent = "Verification failed. Please try again later.";
+      busy = false;
+      setTimeout(function () {
+        ck.classList.remove("done");
+        ck.innerHTML = "";
+        msg.className = "msg";
+        msg.textContent = "Waiting for verification…";
+      }, 4500);
+    }, 1600 + Math.floor(Math.random() * 1400));
+  }
+  ck.addEventListener("click", go);
+  ck.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      go();
+    }
+  });
+})();
+</script>
+</body>
+</html>
+"""
 
 SETUP_HTML = _auth_shell("PX · Setup", """
 <h1>راه‌اندازی PX</h1>
