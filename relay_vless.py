@@ -21,6 +21,7 @@ from main import (
     logger,
     is_link_allowed,
     is_ip_allowed,
+    take_device_slot,
     save_state,
     log_activity,
     now_ir,
@@ -250,18 +251,12 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
 
     ip = _ws_client_ip(ws)
 
-    if not is_ip_allowed(link, uuid, ip):
-        logger.warning("🚫 WS rejected uuid=%s… ip=%s", uuid[:8], ip)
-        log_activity("connection", f"اتصال {ip} رد شد (IP limit)", "warn")
-        await ws.close(code=1008, reason="ip limit reached")
-        return
-
-    conn_limit = int((link or {}).get("connection_limit") or 0)
-    if conn_limit > 0:
-        cur = sum(1 for c in connections.values() if c.get("uuid") == uuid)
-        if cur >= conn_limit:
-            await ws.close(code=1008, reason="connection limit")
-            return
+    # Soft device/connection slots — kick oldest instead of banning (Railway-safe)
+    for old_id in take_device_slot(uuid, ip, link):
+        old = connections.pop(old_id, None)
+        if old:
+            logger.info("↻ slot replace [%s] ← freed for new ip=%s", old_id, ip)
+    # is_ip_allowed always True (compat); slots handled above
 
     conn_id = secrets.token_urlsafe(6)
     connections[conn_id] = {

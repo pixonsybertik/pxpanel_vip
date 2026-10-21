@@ -271,13 +271,55 @@ def now_ir():
     return datetime.utcnow()
 
 def is_ip_allowed(link: dict, uuid: str, ip: str) -> bool:
-    limit = int(link.get("ip_limit") or 0)
-    if limit <= 0:
-        return True
-    ips = unique_ips_for_uuid(uuid)
-    if ip in ips:
-        return True
-    return len(ips) < limit
+    """Soft device slots — never hard-ban on Railway CGNAT.
+    When slots are full, oldest connections are replaced (see take_device_slot).
+    Always returns True for admission; relay calls take_device_slot to free seats.
+    """
+    return True
+
+
+def take_device_slot(uuid: str, ip: str, link: dict | None) -> list[str]:
+    """Return connection ids that should be dropped to free a device/conn slot.
+    - ip_limit = max concurrent *unique IPs* (devices). Full → drop oldest other-IP conns.
+    - connection_limit = max concurrent sockets. Full → drop oldest conns.
+    Does not reject the new client (prevents false bans behind Railway / mobile NAT).
+    """
+    if not link:
+        return []
+    to_drop: list[str] = []
+    ip_limit = int(link.get("ip_limit") or 0)
+    conn_limit = int(link.get("connection_limit") or 0)
+
+    mine = [(cid, c) for cid, c in connections.items() if c.get("uuid") == uuid]
+    if not mine:
+        return []
+
+    # Connection count limit
+    if conn_limit > 0 and len(mine) >= conn_limit:
+        ordered = sorted(mine, key=lambda x: x[1].get("connected_at") or "")
+        need = len(mine) - conn_limit + 1
+        for cid, _ in ordered[:need]:
+            if cid not in to_drop:
+                to_drop.append(cid)
+
+    # Unique device (IP) soft limit — replace oldest, don't ban
+    if ip_limit > 0:
+        by_ip: dict[str, list[str]] = {}
+        for cid, c in mine:
+            by_ip.setdefault(str(c.get("ip") or ""), []).append(cid)
+        if ip in by_ip:
+            return to_drop  # same device reconnecting — ok
+        if len(by_ip) >= ip_limit:
+            # drop all conns from oldest IP group
+            def oldest_ts(ip_key: str) -> str:
+                ids = by_ip[ip_key]
+                times = [connections[i].get("connected_at") or "" for i in ids if i in connections]
+                return min(times) if times else ""
+            victim_ip = sorted(by_ip.keys(), key=oldest_ts)[0]
+            for cid in by_ip[victim_ip]:
+                if cid not in to_drop:
+                    to_drop.append(cid)
+    return to_drop
 
 def generate_vless_link(uuid: str, host: str, remark: str = "PX", protocol: str = "vless-ws",
                        fingerprint: str = "chrome", alpn: str = "http/1.1", port: int = 443) -> str:
@@ -759,7 +801,7 @@ def render_sub_page(uuid: str, link: dict, host: str, lines: list[str], b64: str
   --bg:#121214;--bg2:#1a1a1d;--bg3:#222226;--line:#2e2e33;
   --t1:#ececec;--t2:#a0a0a8;--t3:#6b6b74;
   --acc:#5b7cfa;--ok:#3d9a6a;--bad:#c45c5c;
-  --r:12px;--font:Tahoma,'Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --r:12px;--font:'Vazirmatn','IBM Plex Sans',Tahoma,'Segoe UI',system-ui,sans-serif;
 }}
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:var(--bg);color:var(--t1);font-family:var(--font);font-size:14px;line-height:1.55;letter-spacing:0;direction:rtl;min-height:100vh;padding:28px 16px 48px}}
@@ -908,7 +950,7 @@ MATTE_CSS = r"""
   --bg:#121214;--bg2:#1a1a1d;--bg3:#222226;--line:#2e2e33;
   --t1:#ececec;--t2:#a0a0a8;--t3:#6b6b74;
   --acc:#5b7cfa;--ok:#3d9a6a;--warn:#c4922a;--bad:#c45c5c;
-  --r:10px;--sb:220px;--font:Tahoma,'Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
+  --r:10px;--sb:220px;--font:'Vazirmatn','IBM Plex Sans',Tahoma,'Segoe UI',system-ui,sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:var(--bg);color:var(--t1);font-family:var(--font);font-size:14px;line-height:1.55;letter-spacing:0}
@@ -973,6 +1015,13 @@ th{color:var(--t3);font-weight:600}
 .slider:before{content:"";position:absolute;width:14px;height:14px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.15s}
 .switch input:checked+.slider{background:var(--ok)}
 .switch input:checked+.slider:before{transform:translateX(16px)}
+
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--line);margin-bottom:14px}
+.tab{flex:1;text-align:center;padding:10px 8px;border:none;background:transparent;color:var(--t3);cursor:pointer;font-size:12px;font-family:inherit;font-weight:500;border-bottom:2px solid transparent}
+.tab.on{color:var(--t1);border-bottom-color:var(--acc)}
+.tab-pane{display:none}.tab-pane.on{display:block}
+.modal-bg .modal{width:min(520px,100%)}
+.hint{font-size:11px;color:var(--t3);margin-top:4px;line-height:1.45}
 body{direction:rtl}
 """
 
@@ -980,6 +1029,7 @@ def _auth_shell(title: str, body: str) -> str:
     return f"""<!DOCTYPE html><html lang="fa"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 {MATTE_CSS}
 .auth{{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}
@@ -1184,6 +1234,7 @@ DASH_HTML = f"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PX Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>{MATTE_CSS}</style>
 </head>
 <body>
@@ -1195,7 +1246,7 @@ DASH_HTML = f"""<!DOCTYPE html>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg></button>
     <button class="nav-btn" data-p="configs" onclick="go('configs')">کانفیگ‌ها
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
-    <button class="nav-btn" data-p="create" onclick="go('create')">ساخت
+    <button class="nav-btn" data-p="create" onclick="openCreate()">ساخت
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg></button>
     <button class="nav-btn" data-p="folders" onclick="go('folders')">پوشه‌ها
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg></button>
@@ -1230,7 +1281,7 @@ DASH_HTML = f"""<!DOCTYPE html>
   <section class="page" id="p-configs">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
       <div><div class="h1">کانفیگ‌ها</div><div class="sub" style="margin:0">مدیریت لینک‌ها و محدودیت‌ها</div></div>
-      <button class="btn btn-p" onclick="go('create')">ساخت جدید</button>
+      <button class="btn btn-p" onclick="openCreate()">ساخت جدید</button>
     </div>
     <div class="card" style="overflow:auto">
       <table>
@@ -1240,37 +1291,9 @@ DASH_HTML = f"""<!DOCTYPE html>
     </div>
   </section>
 
-  <section class="page" id="p-create">
-    <div class="h1">ساخت کانفیگ</div>
-    <div class="sub">VLESS WS پیش‌فرض · XHTTP در پیشرفته</div>
-    <div class="card" style="max-width:520px">
-      <div class="field"><label>نام</label><input id="cName" placeholder="auto"></div>
-      <div class="row2">
-        <div class="field"><label>تعداد در ساب</label><input id="cCount" type="number" value="1" min="1" max="40"></div>
-        <div class="field"><label>انقضا (روز)</label><input id="cDays" type="number" value="0" min="0"></div>
-      </div>
-      <div class="row2">
-        <div class="field"><label>حجم (GB) · 0=∞</label><input id="cLimit" type="number" value="0" min="0"></div>
-        <div class="field"><label>سرعت (Mbps) · 0=∞</label><input id="cSpeed" type="number" value="0" min="0"></div>
-      </div>
-      <div class="row2">
-        <div class="field"><label>محدودیت IP</label><input id="cIp" type="number" value="0" min="0"></div>
-        <div class="field"><label>محدودیت کاربر</label><input id="cConn" type="number" value="0" min="0"></div>
-      </div>
-      <div class="field"><label>پوشه</label><select id="cFolder"></select></div>
-      <button type="button" class="btn" onclick="document.getElementById('adv').classList.toggle('open')">تنظیمات پیشرفته</button>
-      <div class="adv" id="adv">
-        <div class="field"><label>پروتکل</label>
-          <select id="cProto"><option value="vless-ws">VLESS WS (پایدار Railway)</option><option value="xhttp-stream-up">XHTTP Fast</option></select>
-        </div>
-        <div class="field"><label>یادداشت</label><input id="cNote"></div>
-      </div>
-      <button class="btn btn-p" style="width:100%;margin-top:12px" onclick="createLink()">ساخت</button>
-      <div id="created" class="muted" style="margin-top:12px;word-break:break-all"></div>
-    </div>
-  </section>
+  <section class="page" id="p-create" style="display:none"></section>
 
-  <section class="page" id="p-folders">
+<section class="page" id="p-folders">
     <div class="h1">پوشه‌ها</div>
     <div class="sub">دسته‌بندی کانفیگ‌ها برای تیم فروش</div>
     <div class="card" style="max-width:420px">
@@ -1287,6 +1310,77 @@ DASH_HTML = f"""<!DOCTYPE html>
   </section>
 </main>
 </div>
+
+<div class="modal-bg" id="createBg">
+  <div class="modal">
+    <h3 style="display:flex;justify-content:space-between;align-items:center">
+      <span>ساخت کانفیگ</span>
+      <button class="btn btn-sm" onclick="closeCreate()" type="button">✕</button>
+    </h3>
+    <div class="tabs">
+      <button type="button" class="tab on" data-tab="g" onclick="switchTab('g')">عمومی</button>
+      <button type="button" class="tab" data-tab="l" onclick="switchTab('l')">محدودیت‌ها</button>
+      <button type="button" class="tab" data-tab="a" onclick="switchTab('a')">پیشرفته</button>
+    </div>
+    <div class="tab-pane on" id="tab-g">
+      <div class="field"><label>نام</label><input id="cName" placeholder="خودکار در صورت خالی"></div>
+      <div class="row2">
+        <div class="field"><label>تعداد در ساب</label><input id="cCount" type="number" value="1" min="1" max="40"></div>
+        <div class="field"><label>انقضا (روز) · ۰=∞</label><input id="cDays" type="number" value="0" min="0"></div>
+      </div>
+      <div class="field"><label>پوشه</label><select id="cFolder"></select></div>
+      <div class="field"><label>یادداشت</label><input id="cNote" placeholder="اختیاری"></div>
+    </div>
+    <div class="tab-pane" id="tab-l">
+      <div class="field"><label>حجم (GB) · ۰=نامحدود</label><input id="cLimit" type="number" value="0" min="0" step="0.1"></div>
+      <div class="field"><label>سرعت (Mbps) · ۰=نامحدود</label><input id="cSpeed" type="number" value="0" min="0">
+        <div class="hint">محدودیت نرم: burst مجاز است و تونل برای رعایت سقف قطع نمی‌شود (مناسب Railway).</div>
+      </div>
+      <div class="field"><label>حداکثر دستگاه هم‌زمان (اسلات)</label><input id="cIp" type="number" value="0" min="0">
+        <div class="hint">به‌جای بن IP: وقتی ظرفیت پر باشد قدیمی‌ترین اتصال جایگزین می‌شود. روی Railway / اینترنت موبایل باعث بن اشتباه نمی‌شود.</div>
+      </div>
+      <div class="field"><label>حداکثر اتصال هم‌زمان</label><input id="cConn" type="number" value="0" min="0">
+        <div class="hint">سقف سوکت فعال. ۰ = بدون سقف. اتصال جدید در صورت پر بودن، قدیمی را قطع می‌کند.</div>
+      </div>
+    </div>
+    <div class="tab-pane" id="tab-a">
+      <div class="field"><label>پروتکل</label>
+        <select id="cProto">
+          <option value="vless-ws">VLESS · WebSocket + TLS (پایدار Railway)</option>
+          <option value="xhttp-stream-up">XHTTP Fast (stream-up)</option>
+        </select>
+      </div>
+      <div class="field"><label>Fingerprint (uTLS)</label>
+        <select id="cFp">
+          <option value="chrome">chrome</option>
+          <option value="firefox">firefox</option>
+          <option value="safari">safari</option>
+          <option value="ios">ios</option>
+          <option value="android">android</option>
+          <option value="edge">edge</option>
+          <option value="random">random</option>
+        </select>
+      </div>
+      <div class="row2">
+        <div class="field"><label>ALPN</label>
+          <select id="cAlpn">
+            <option value="http/1.1">http/1.1 (پیشنهادی WS)</option>
+            <option value="h2,http/1.1">h2,http/1.1</option>
+            <option value="h2">h2</option>
+          </select>
+        </div>
+        <div class="field"><label>پورت</label><input id="cPort" type="number" value="443" min="1" max="65535"></div>
+      </div>
+      <div class="hint">روی Railway فقط مسیر WS/XHTTP از edge عبور می‌کند. UDP (Hysteria/TUIC) پشتیبانی نمی‌شود.</div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
+      <button type="button" class="btn" onclick="closeCreate()">انصراف</button>
+      <button type="button" class="btn btn-p" onclick="createLink()">ساخت کانفیگ</button>
+    </div>
+    <div id="created" class="muted" style="margin-top:12px;word-break:break-all"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 <div class="modal-bg" id="editBg">
   <div class="modal">
@@ -1298,8 +1392,8 @@ DASH_HTML = f"""<!DOCTYPE html>
       <div class="field"><label>سرعت Mbps</label><input id="eSpeed" type="number" min="0"></div>
     </div>
     <div class="row2">
-      <div class="field"><label>IP limit</label><input id="eIp" type="number" min="0"></div>
-      <div class="field"><label>User limit</label><input id="eConn" type="number" min="0"></div>
+      <div class="field"><label>اسلات دستگاه</label><input id="eIp" type="number" min="0"></div>
+      <div class="field"><label>اتصال هم‌زمان</label><input id="eConn" type="number" min="0"></div>
     </div>
     <div class="field"><label>پوشه</label><select id="eFolder"></select></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
@@ -1321,6 +1415,20 @@ async function api(url,opt){{
   if(!r.ok){{toast(j.detail||j.error||'خطا');return null}}
   return j;
 }}
+
+function switchTab(id){{
+  document.querySelectorAll('#createBg .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===id));
+  document.querySelectorAll('#createBg .tab-pane').forEach(p=>p.classList.toggle('on',p.id==='tab-'+id));
+}}
+function openCreate(){{
+  fillFolders('cFolder');
+  $('created').innerHTML='';
+  switchTab('g');
+  $('createBg').classList.add('open');
+}}
+function closeCreate(){{ $('createBg').classList.remove('open'); }}
+document.getElementById('createBg')?.addEventListener('click',e=>{{ if(e.target.id==='createBg') closeCreate(); }});
+
 function go(name){{
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
   document.querySelectorAll('.nav-btn').forEach(b=>b.classList.toggle('on',b.dataset.p===name));
@@ -1434,6 +1542,9 @@ async function createLink(){{
     ip_limit:Number($('cIp').value)||0,connection_limit:Number($('cConn').value)||0,
     folder_id:$('cFolder').value||'0',
     protocol:$('cProto').value||'vless-ws',
+    fingerprint:$('cFp')?.value||'chrome',
+    alpn:$('cAlpn')?.value||'http/1.1',
+    port:Number($('cPort')?.value)||443,
     note:$('cNote').value||''
   }};
   const r=await api('/api/links',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
