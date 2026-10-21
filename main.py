@@ -266,7 +266,7 @@ def unique_ips_for_uuid(uuid: str) -> set:
 
 # ── Compat aliases for relay_vless / xhttp_siz10 ─────────────
 is_link_allowed = is_allowed
-hourly_traffic: dict = {}
+hourly_traffic = defaultdict(int)
 def now_ir():
     return datetime.utcnow()
 
@@ -759,10 +759,10 @@ def render_sub_page(uuid: str, link: dict, host: str, lines: list[str], b64: str
   --bg:#121214;--bg2:#1a1a1d;--bg3:#222226;--line:#2e2e33;
   --t1:#ececec;--t2:#a0a0a8;--t3:#6b6b74;
   --acc:#5b7cfa;--ok:#3d9a6a;--bad:#c45c5c;
-  --r:12px;--font:'Segoe UI',Tahoma,system-ui,sans-serif;
+  --r:12px;--font:Tahoma,'Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
 }}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:var(--bg);color:var(--t1);font-family:var(--font);font-size:13px;direction:rtl;min-height:100vh;padding:28px 16px 48px}}
+body{{background:var(--bg);color:var(--t1);font-family:var(--font);font-size:14px;line-height:1.55;letter-spacing:0;direction:rtl;min-height:100vh;padding:28px 16px 48px}}
 .wrap{{max-width:640px;margin:0 auto}}
 .brand{{font-size:12px;color:var(--t3);letter-spacing:.08em;margin-bottom:8px}}
 h1{{font-size:20px;font-weight:700;margin-bottom:6px}}
@@ -908,10 +908,10 @@ MATTE_CSS = r"""
   --bg:#121214;--bg2:#1a1a1d;--bg3:#222226;--line:#2e2e33;
   --t1:#ececec;--t2:#a0a0a8;--t3:#6b6b74;
   --acc:#5b7cfa;--ok:#3d9a6a;--warn:#c4922a;--bad:#c45c5c;
-  --r:10px;--sb:220px;--font:'Segoe UI',Tahoma,system-ui,sans-serif;
+  --r:10px;--sb:220px;--font:Tahoma,'Segoe UI',system-ui,-apple-system,'Helvetica Neue',Arial,sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:var(--bg);color:var(--t1);font-family:var(--font);font-size:13px}
+html,body{height:100%;background:var(--bg);color:var(--t1);font-family:var(--font);font-size:14px;line-height:1.55;letter-spacing:0}
 a{color:var(--acc);text-decoration:none}
 button,input,select{font-family:inherit}
 .shell{display:flex;min-height:100vh}
@@ -1008,7 +1008,7 @@ DECOY_HTML = r"""<!DOCTYPE html>
 <style>
 html,body{height:100%;margin:0;padding:0}
 body{
-  font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen,Ubuntu,Cantarell,"Helvetica Neue",Arial,sans-serif;
+  font-family:Tahoma,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
   background:#f0f2f5;color:#1c1e21;
   display:flex;align-items:center;justify-content:center;
   min-height:100vh;padding:20px;

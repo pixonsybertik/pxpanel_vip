@@ -1,20 +1,19 @@
-# speed_limit.py
+# speed_limit.py — token bucket (only when speed_limit_bytes > 0)
 import asyncio
 import time
-
 from main import LINKS
 
 _buckets: dict = {}
+MIN_RATE = 8 * 1024
+MIN_BURST = 64 * 1024
 
-MIN_RATE = 1024          
-MIN_BURST = 16 * 1024    
 
 class _Bucket:
     __slots__ = ("rate", "capacity", "tokens", "last")
 
     def __init__(self, rate_bytes_per_sec: float):
         self.rate = max(rate_bytes_per_sec, MIN_RATE)
-        self.capacity = max(self.rate, MIN_BURST)
+        self.capacity = max(self.rate * 1.5, MIN_BURST)
         self.tokens = self.capacity
         self.last = time.monotonic()
 
@@ -33,12 +32,12 @@ class _Bucket:
                 return
             deficit = n - self.tokens
             wait = deficit / self.rate
-            await asyncio.sleep(min(max(wait, 0.004), 0.5))
+            await asyncio.sleep(min(max(wait, 0.002), 0.25))
 
 
 def _get_bucket(uuid: str, rate: int) -> _Bucket:
     b = _buckets.get(uuid)
-    if b is None or b.rate != max(rate, MIN_RATE):
+    if b is None or abs(b.rate - rate) > 1:
         b = _Bucket(rate)
         _buckets[uuid] = b
     return b
@@ -50,9 +49,8 @@ async def throttle(uuid: str, nbytes: int):
     link = LINKS.get(uuid)
     rate = int((link or {}).get("speed_limit_bytes", 0) or 0)
     if rate <= 0:
-        return
-    bucket = _get_bucket(uuid, rate)
-    await bucket.consume(nbytes)
+        return  # unlimited — zero overhead
+    await _get_bucket(uuid, rate).consume(nbytes)
 
 
 def reset_bucket(uuid: str):
